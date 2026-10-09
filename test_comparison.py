@@ -196,6 +196,222 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(window.left.frame.pixels.shape, (20, 50))
         self.assertEqual(window.right.frame.pixels.shape, (10, 25))
 
+    def test_scale_lock_preserves_mapping_across_samples_and_edits(self):
+        from dataclasses import replace
+        window = self.window
+        window.compare.setChecked(True)
+        window.right.move_sample(1)
+        window.activate_panel(window.left)
+        mode = window.left.active_mode
+        dark_high = window.left.styles[mode].high
+        window.scale_lock.setChecked(True)
+        left, right = window.left, window.right
+        reference = replace(left.styles[mode])
+        self.assertGreater(reference.high, dark_high * 9)
+        self.assertEqual(right.styles[mode], reference)
+        self.assertFalse(right.auto_checkbox.isChecked())
+        self.assertTrue(left.scale_legend.isVisible())
+        self.assertTrue(right.scale_legend.isVisible())
+        before = right.frame.pixels.copy()
+        right.move_sample(-1)
+        right.move_sample(1)
+        self.assertEqual(right.styles[mode], reference)
+        window.activate_panel(right)
+        right.low.setText('0')
+        right.high.setText('12000')
+        right.gamma.setText('1')
+        right.invert.setChecked(False)
+        right.draw()
+        right.set_channel_color(mode, (255, 0, 0))
+        self.assertEqual(left.styles[mode], right.styles[mode])
+        self.assertEqual(left.styles[mode].high, 12000)
+        np.testing.assert_array_equal(right.frame.pixels, before)
+        left_image = left.view.item.pixmap().toImage()
+        right_image = right.view.item.pixmap().toImage()
+        self.assertGreater(right_image.pixelColor(0, 0).red(), left_image.pixelColor(0, 0).red())
+        self.assertEqual(left_image.pixelColor(0, 18), right_image.pixelColor(0, 0))
+        right.high.setText('bad')
+        right.draw()
+        self.assertEqual(left.styles[mode].high, 12000)
+        window.scale_lock.setChecked(False)
+        right.high.setText('24000')
+        right.draw()
+        self.assertEqual(left.styles[mode].high, 12000)
+        self.assertEqual(right.styles[mode].high, 24000)
+
+    def test_locked_auto_is_one_shot_and_new_channels_share_scale(self):
+        window = self.window
+        window.compare.setChecked(True)
+        window.right.move_sample(1)
+        window.activate_panel(window.right)
+        window.scale_lock.setChecked(True)
+        mode = window.right.active_mode
+        window.right.set_limits(True)
+        shared = window.right.styles[mode]
+        self.assertEqual(window.left.styles[mode], shared)
+        window.right.move_sample(-1)
+        self.assertEqual(window.right.styles[mode], shared)
+        for panel in (window.left, window.right):
+            panel.active_mode = 'Red'
+            panel.only_active()
+        self.assertEqual(window.left.styles['Red'], window.right.styles['Red'])
+        window.compare.setChecked(False)
+        window.left.high.setText('15000')
+        window.left.draw()
+        window.compare.setChecked(True)
+        self.assertTrue(window.scale_lock.isChecked())
+        self.assertEqual(window.left.styles['Red'], window.right.styles['Red'])
+
+    def test_locked_channel_navigation_and_unlocked_independence(self):
+        window = self.window
+        window.compare.setChecked(True)
+        left, right = window.left, window.right
+        right.move_sample(1)
+        right.active_mode = 'Red'
+        right.only_active()
+        window.activate_panel(right)
+        samples = (left.sample_key, right.sample_key)
+        window.scale_lock.setChecked(True)
+        self.assertEqual(left.selected_modes, {'Red'})
+        self.assertEqual(right.selected_modes, {'Red'})
+        window.channel_next.click()
+        self.assertEqual(left.selected_modes, {'Green'})
+        self.assertEqual(right.selected_modes, {'Green'})
+        self.assertEqual(left.active_mode, right.active_mode)
+        right.view.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(right.view, Qt.Key.Key_Left, Qt.KeyboardModifier.AltModifier)
+        self.assertEqual(left.selected_modes, {'Red'})
+        self.assertEqual(right.selected_modes, {'Red'})
+        index = window.channel_selector.findData('Green')
+        window.channel_selector.setCurrentIndex(index)
+        window.channel_selector.activated.emit(index)
+        self.assertEqual(left.selected_modes, {'Green'})
+        self.assertEqual(right.selected_modes, {'Green'})
+        self.assertEqual((left.sample_key, right.sample_key), samples)
+        self.assertEqual(left.styles['Green'], right.styles['Green'])
+        window.scale_lock.setChecked(False)
+        window.channel_next.click()
+        self.assertEqual(left.selected_modes, {'Green'})
+        self.assertEqual(right.selected_modes, {'Red'})
+
+    def test_locked_overlay_and_hidden_panel_follow_selection(self):
+        window = self.window
+        window.scale_lock.setChecked(True)
+        left, right = window.left, window.right
+        left.active_mode = 'Green'
+        left.only_active()
+        right.channel_items['Red'].setCheckState(0, Qt.CheckState.Checked)
+        self.assertEqual(left.selected_modes, {'Green', 'Red'})
+        self.assertEqual(right.selected_modes, {'Green', 'Red'})
+        self.assertIsNot(left.selected_modes, right.selected_modes)
+        left.channels.setCurrentItem(left.channel_items['Red'])
+        self.assertEqual(right.active_mode, 'Red')
+        self.assertEqual(right.selected_modes, {'Green', 'Red'})
+        for mode in ('Green', 'Red'):
+            left.channel_items[mode].setCheckState(0, Qt.CheckState.Unchecked)
+        self.assertEqual(right.selected_modes, set())
+        self.assertIsNone(left.view.item)
+        self.assertIsNone(right.view.item)
+        window.compare.setChecked(False)
+        left.active_mode = 'Red'
+        left.only_active()
+        window.compare.setChecked(True)
+        self.assertEqual(right.selected_modes, {'Red'})
+        self.assertEqual(right.active_mode, 'Red')
+
+    def test_locked_missing_channel_does_not_fall_back(self):
+        window = self.window
+        window.compare.setChecked(True)
+        left, right = window.left, window.right
+        right.move_sample(1)
+        # Simulate a sample without this acquisition, without deleting fixture files.
+        right.samples[right.sample_key].pop('Red')
+        right.cache.clear()
+        window.activate_panel(left)
+        window.scale_lock.setChecked(True)
+        left.active_mode = 'Red'
+        left.only_active()
+        self.assertEqual(right.selected_modes, {'Red'})
+        self.assertEqual(right.active_mode, 'Red')
+        self.assertEqual(right.layers, {})
+        self.assertIsNone(right.view.item)
+        self.assertIn('Red: отсутствует', right.notice.text())
+        right.move_sample(-1)
+        self.assertEqual(set(right.layers), {'Red'})
+        self.assertEqual(left.styles['Red'], right.styles['Red'])
+
+    def test_joint_scale_is_independent_of_active_side_and_resolution(self):
+        from dataclasses import replace
+        window = self.window
+        bright = np.arange(1000, 11000, 40, dtype=np.uint16).reshape(10, 25)
+        tifffile.imwrite(window.folder / 'B' / 'capture(Green).raw16.tif', bright)
+        window.compare.setChecked(True)
+        left, right = window.left, window.right
+        right.move_sample(1)
+        for panel in (left, right):
+            panel.active_mode = 'Green'
+            panel.only_active()
+        originals = [p.frame.pixels.copy() for p in (left, right)]
+        limits = [detail_settings(p.frame.pixels) for p in (left, right)]
+        window.activate_panel(left)
+        window.scale_lock.setChecked(True)
+        reference = replace(left.styles['Green'])
+        self.assertAlmostEqual(reference.low, min(s[0] for s in limits))
+        self.assertAlmostEqual(reference.high, max(s[1] for s in limits))
+        self.assertEqual(reference, right.styles['Green'])
+        display = render_pixels(bright, reference.low, reference.high, reference.gamma, reference.invert)
+        self.assertLess(np.mean(display == 255), 0.02)
+        window.scale_lock.setChecked(False)
+        window.activate_panel(right)
+        window.scale_lock.setChecked(True)
+        self.assertEqual(reference, left.styles['Green'])
+        window.activate_panel(left)
+        left.high.setText('500')
+        left.draw()
+        left.set_limits(True)
+        self.assertEqual(reference, left.styles['Green'])
+        self.assertEqual(reference, right.styles['Green'])
+        for panel, original in zip((left, right), originals):
+            np.testing.assert_array_equal(panel.frame.pixels, original)
+        right.samples[right.sample_key].pop('Green')
+        left.set_limits(True)
+        self.assertAlmostEqual(left.styles['Green'].high, limits[0][1])
+        self.assertEqual(left.styles['Green'], right.styles['Green'])
+
+    def test_hover_reads_inactive_panel_without_clicking(self):
+        from PyQt6.QtCore import QPointF, QEvent
+        window = self.window
+        window.compare.setChecked(True)
+        left, right = window.left, window.right
+        right.move_sample(1)
+        self.app.processEvents()
+        window.equalize_views()
+        for active, hovered in ((left, right), (right, left)):
+            window.activate_panel(active)
+            selected = window.tree.currentItem()
+            controls = window.controls.currentWidget()
+            point = hovered.view.mapFromScene(QPointF(10.5, 5.5))
+            QTest.mouseMove(hovered.view.viewport(), point)
+            self.app.processEvents()
+            mapped = hovered.view.mapToScene(point)
+            x, y = int(mapped.x()), int(mapped.y())
+            mode = next(iter(hovered.layers))
+            expected = int(hovered.layers[mode].pixels[y, x])
+            message = window.statusBar().currentMessage()
+            self.assertIn(hovered.accessibleName(), message)
+            self.assertIn(f'RAW16={expected}', message)
+            self.assertIs(window.active, active)
+            self.assertIs(window.tree.currentItem(), selected)
+            self.assertIs(window.controls.currentWidget(), controls)
+            window.statusBar().clearMessage()
+            hovered.view.pixel_hovered.emit(mapped.x(), mapped.y())
+            self.assertIn(f'RAW16={expected}', window.statusBar().currentMessage())
+            hovered.view.pixel_hovered.emit(-1, -1)
+            self.assertIn('За пределами изображения', window.statusBar().currentMessage())
+            QApplication.sendEvent(hovered.view.viewport(), QEvent(QEvent.Type.Leave))
+            self.assertNotIn('RAW16=', window.statusBar().currentMessage())
+
 
 if __name__ == '__main__':
     unittest.main()

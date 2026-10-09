@@ -255,10 +255,20 @@ class ChannelViewer(Viewer):
                     self.samples.setdefault(key, {}).setdefault(capture.mode, []).append(capture)
             self.sample_keys = list(self.samples)
             modes = sorted({mode for sample in self.samples.values() for mode in sample})
-            palette = [(255, 80, 110), (70, 220, 255), (100, 255, 110),
-                       (255, 190, 50), (185, 110, 255), (255, 255, 255), (80, 120, 255)]
+            default_colors = {
+                'flamingo': (255, 0, 0),
+                'cy7': (0, 0, 255),
+                'alexa488': (0, 255, 0),
+                'starbrightb700': (0, 220, 255),
+                'cy5.5': (185, 110, 255),
+                'cy5': (255, 190, 50),
+                'ponceaus': (255, 80, 180),
+            }
+            palette = [(255, 255, 255), (100, 255, 110), (70, 220, 255),
+                       (255, 190, 50), (185, 110, 255), (255, 80, 180)]
             for i, mode in enumerate(modes):
-                self.colors.setdefault(mode, palette[i % len(palette)])
+                normalized = ''.join(mode.casefold().split())
+                self.colors.setdefault(mode, default_colors.get(normalized, palette[i % len(palette)]))
                 item = QTreeWidgetItem(self.channels, [mode, '●'])
                 item.setData(0, Qt.ItemDataRole.UserRole, mode)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -273,7 +283,11 @@ class ChannelViewer(Viewer):
                 target = previous if previous in self.samples else next(
                     (key for key in self.sample_keys if '261009_Mono16' in str(key[0])), self.sample_keys[0])
                 if not self.initialized:
-                    self.selected_modes = {next(iter(self.samples[target]))}
+                    primary = next((mode for mode in self.samples[target]
+                                    if mode.strip().casefold() == 'flamingo'),
+                                   next(iter(self.samples[target])))
+                    self.selected_modes = {primary}
+                    self.active_mode = primary
                     self.initialized = True
                 if self.active_mode not in modes:
                     self.active_mode = next((mode for mode in modes if mode in self.selected_modes), modes[0])

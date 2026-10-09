@@ -30,6 +30,104 @@ class HostedPanel(ChannelViewer):
     def choose_folder(self):
         self.host.open_folder()
 
+    def frame_for(self, mode):
+        host = getattr(self, 'host', None)
+        locked = host is not None and host.scale_lock.isChecked()
+        if locked and mode not in host.shared_styles:
+            style = host.fit_shared_style(mode)
+            if style is not None:
+                host.shared_styles[mode] = style
+        if locked and mode in host.shared_styles:
+            self.styles[mode] = replace(host.shared_styles[mode])
+            self.colors[mode] = self.styles[mode].color
+            self.fixed_modes.add(mode)
+        return super().frame_for(mode)
+
+    def draw(self):
+        if not self.host.scale_lock.isChecked():
+            return super().draw()
+        if self.frame is None:
+            return
+        import math
+        from channel_viewer import ChannelStyle
+        try:
+            low, high, gamma = (float(entry.text().replace(',', '.')) for entry in (self.low, self.high, self.gamma))
+            if not all(math.isfinite(value) for value in (low, high, gamma)) or high <= low or gamma <= 0:
+                raise ValueError('Максимум должен быть больше минимума; гамма > 0')
+        except ValueError as error:
+            self.statusBar().showMessage(f'Не удалось обновить отображение: {error}')
+            return
+        style = ChannelStyle(low, high, gamma, self.invert.isChecked(), self.colors[self.active_mode])
+        self.host.publish_scale(self.active_mode, style)
+
+    def set_auto_mode(self, enabled):
+        if not self.host.scale_lock.isChecked():
+            return super().set_auto_mode(enabled)
+        if enabled and self.active_mode is not None:
+            style = self.host.fit_shared_style(self.active_mode)
+            if style is not None:
+                self.host.publish_scale(self.active_mode, style)
+        self.auto_checkbox.setChecked(False)
+
+    def set_channel_color(self, mode, color):
+        if not self.host.scale_lock.isChecked():
+            return super().set_channel_color(mode, color)
+        self.frame_for(mode)
+        style = self.host.shared_styles.get(mode)
+        if style is None:
+            from channel_viewer import ChannelStyle
+            style = ChannelStyle(0, 65535, 1, False, color)
+        self.host.publish_scale(mode, replace(style, color=color))
+
+    def only_active(self):
+        if not self.host.scale_lock.isChecked():
+            return super().only_active()
+        if self.active_mode is not None:
+            self.selected_modes = {self.active_mode}
+            self.host.sync_channels(self)
+
+    def toggle_channel(self, item, column):
+        if self.updating or column != 0:
+            return
+        if not self.host.scale_lock.isChecked():
+            return super().toggle_channel(item, column)
+        mode = item.data(0, Qt.ItemDataRole.UserRole)
+        if item.checkState(0) == Qt.CheckState.Checked:
+            self.selected_modes.add(mode)
+        else:
+            self.selected_modes.discard(mode)
+        self.host.sync_channels(self)
+
+    def activate_channel(self, current, previous=None):
+        if self.updating or current is None:
+            return
+        if not self.host.scale_lock.isChecked():
+            return super().activate_channel(current, previous)
+        self.active_mode = current.data(0, Qt.ItemDataRole.UserRole)
+        self.host.sync_channels(self)
+
+    def cycle_channel(self, step):
+        if not self.host.scale_lock.isChecked():
+            return super().cycle_channel(step)
+        # Use one stable order on both sides, including channels missing in one sample.
+        modes = sorted({mode for panel in (self.host.left, self.host.right)
+                        if panel is not None for mode in panel.channel_items})
+        if not modes:
+            return
+        if self.active_mode in modes:
+            index = (modes.index(self.active_mode) + step) % len(modes)
+        else:
+            index = 0 if step >= 0 else len(modes) - 1
+        self.active_mode = modes[index]
+        self.only_active()
+
+    def inspect_pixel(self, scene_x, scene_y):
+        super().inspect_pixel(scene_x, scene_y)
+        # Publish every hover, including repeated values on an inactive panel.
+        sample = self.sample_key[1] if self.sample_key else 'Нет образца'
+        self.host.statusBar().showMessage(
+            f'{self.accessibleName()} · {sample} | {self.statusBar().currentMessage()}')
+
 
 class ComparisonViewer(QMainWindow):
     def __init__(self, folder):
@@ -125,12 +223,22 @@ class ComparisonViewer(QMainWindow):
         return combo
 
     def make_panel(self, title, folder):
+        from PyQt6.QtWidgets import QScrollArea
+        from scale_legend import ScaleLegend
+
+        if not hasattr(self, 'scale_lock'):
+            self.shared_styles = {}
+            self.scale_lock = QToolButton()
+            self.scale_lock.setText('🔓 Шкалы')
+            self.scale_lock.setCheckable(True)
+            self.scale_lock.setToolTip('Общая шкала из активной панели: границы, гамма, инверсия и цвет каждого канала')
+            self.scale_lock.toggled.connect(self.set_scale_lock)
+            self.navigation.insertWidget(1, self.scale_lock)
         panel = HostedPanel(folder)
         panel.host = self
         panel.setWindowFlags(Qt.WindowType.Widget)
         panel.setMinimumSize(0, 0)
         panel.setAccessibleName(title)
-        # Only image and a one-line caption remain in each equal-sized pane.
         navigation = panel.centralWidget().layout().itemAt(0).layout()
         for index in range(navigation.count()):
             widget = navigation.itemAt(index).widget()
@@ -139,7 +247,22 @@ class ComparisonViewer(QMainWindow):
         panel.caption = QLabel(title)
         panel.caption.setFixedHeight(24)
         panel.caption.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        panel.centralWidget().layout().insertWidget(0, panel.caption)
+        layout = panel.centralWidget().layout()
+        layout.insertWidget(0, panel.caption)
+        layout.removeWidget(panel.view)
+        image_row = QHBoxLayout()
+        image_row.setContentsMargins(0, 0, 0, 0)
+        image_row.setSpacing(2)
+        image_row.addWidget(panel.view, 1)
+        panel.scale_legend = ScaleLegend()
+        legend_scroll = QScrollArea()
+        legend_scroll.setWidget(panel.scale_legend)
+        legend_scroll.setWidgetResizable(True)
+        legend_scroll.setFixedWidth(146)
+        legend_scroll.setMinimumHeight(0)
+        legend_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        image_row.addWidget(legend_scroll)
+        layout.addLayout(image_row, 1)
         panel.removeDockWidget(panel.sidebar)
         panel.sidebar_tabs.setParent(self.controls)
         self.controls.addWidget(panel.sidebar_tabs)
@@ -152,17 +275,20 @@ class ComparisonViewer(QMainWindow):
             widget.setProperty('comparison_panel', title)
             widget.installEventFilter(self)
         panel.state_changed.connect(self.sync_ui)
+        panel.state_changed.connect(self.update_scale_legends)
         return panel
 
     def eventFilter(self, watched, event):
+        title = watched.property('comparison_panel')
         if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.FocusIn):
-            title = watched.property('comparison_panel')
             for panel in (getattr(self, 'left', None), self.right):
                 if panel is not None and panel.accessibleName() == title:
                     self.activate_panel(panel)
                     break
-        if event.type() == QEvent.Type.Resize and watched.property('comparison_panel'):
+        if event.type() == QEvent.Type.Resize and title:
             self.fit_timer.start(0)
+        if event.type() == QEvent.Type.Leave and title:
+            self.statusBar().showMessage('Наведите курсор на любое изображение для чтения RAW16')
         return super().eventFilter(watched, event)
 
     def activate_panel(self, panel):
@@ -211,7 +337,8 @@ class ComparisonViewer(QMainWindow):
             self.sample_selector.clear()
             for key in panel.sample_keys:
                 self.sample_selector.addItem(f'{key[1]} | {key[0].name}', key)
-            self.sample_selector.setCurrentIndex(panel.sample_keys.index(panel.sample_key) if panel.sample_key in panel.sample_keys else -1)
+            self.sample_selector.setCurrentIndex(
+                panel.sample_keys.index(panel.sample_key) if panel.sample_key in panel.sample_keys else -1)
             self.channel_selector.clear()
             for mode in panel.channel_items:
                 missing = mode not in panel.samples.get(panel.sample_key, {})
@@ -226,7 +353,8 @@ class ComparisonViewer(QMainWindow):
                 text = f'{candidate.accessibleName()}: {sample} · {channels}'
                 candidate.caption.setText(text)
                 candidate.caption.setToolTip(text)
-                candidate.caption.setStyleSheet('background: #285c8a; color: white; padding-left: 6px;' if candidate is panel else 'padding-left: 6px;')
+                candidate.caption.setStyleSheet(
+                    'background: #285c8a; color: white; padding-left: 6px;' if candidate is panel else 'padding-left: 6px;')
         finally:
             self.syncing = False
         self.fit_timer.start(0)
@@ -309,3 +437,111 @@ class ComparisonViewer(QMainWindow):
             panel.view.fit_viewport_size = common if len(panels) == 2 else None
             if panel.view.zoom_mode == 'Вписать':
                 panel.view.apply_zoom()
+
+    def set_scale_lock(self, enabled):
+        self.scale_lock.setText('🔒 Шкалы' if enabled else '🔓 Шкалы')
+        if enabled:
+            if not self.compare.isChecked():
+                self.compare.setChecked(True)
+            source = self.active
+            modes = {mode for panel in (self.left, self.right)
+                     if panel is not None for mode in panel.channel_items}
+            styles = {}
+            for mode in sorted(modes):
+                style = self.fit_shared_style(mode)
+                if style is not None:
+                    styles[mode] = style
+            self.shared_styles = styles
+            self.apply_shared_scales()
+            self.sync_channels(source)
+        else:
+            # Preserve the last shared mapping until explicit auto or manual editing.
+            self.shared_styles.clear()
+            for panel in (self.left, self.right):
+                if panel is not None:
+                    panel.update_active()
+        self.update_scale_legends()
+
+    def apply_shared_scales(self):
+        for panel in (self.left, self.right):
+            if panel is None:
+                continue
+            for mode, style in self.shared_styles.items():
+                panel.styles[mode] = replace(style)
+                panel.colors[mode] = style.color
+                panel.fixed_modes.add(mode)
+            panel.channels.blockSignals(True)
+            try:
+                for mode, item in panel.channel_items.items():
+                    item.setForeground(1, QColor(*panel.colors[mode]))
+            finally:
+                panel.channels.blockSignals(False)
+            panel.update_active()
+            panel.render_selection()
+        self.update_scale_legends()
+
+    def publish_scale(self, mode, style):
+        self.shared_styles[mode] = replace(style)
+        self.apply_shared_scales()
+
+    def update_scale_legends(self):
+        self.scale_lock.setToolTip(
+            'При включении шкала учитывает оба снимка. Шкалы и каналы связаны; образцы выбираются независимо.')
+        for panel in (getattr(self, 'left', None), self.right):
+            if panel is not None:
+                panel.scale_legend.set_scales(panel, self.scale_lock.isChecked())
+                if self.scale_lock.isChecked():
+                    panel.auto_checkbox.setChecked(False)
+                    panel.auto_checkbox.setToolTip(
+                        'Авто один раз учитывает оба снимка и фиксирует общую шкалу. Гамма — по снимку с большей верхней границей.')
+                else:
+                    panel.auto_checkbox.setToolTip(
+                        'Автоматическая шкала отдельно для каждого снимка.')
+        if self.scale_lock.isChecked() and self.right is not None:
+            if set(self.left.layers) != set(self.right.layers):
+                self.statusBar().showMessage(
+                    'Не все выбранные каналы доступны в обеих панелях. Отсутствующие каналы отмечены в списке и на шкалах.')
+
+    def sync_channels(self, source):
+        if not self.scale_lock.isChecked() or getattr(self, 'syncing_channels', False):
+            return
+        self.syncing_channels = True
+        try:
+            selected = set(source.selected_modes)
+            active_mode = source.active_mode
+            for panel in (self.left, self.right):
+                if panel is not None:
+                    panel.selected_modes = set(selected)
+                    panel.active_mode = active_mode
+                    panel.refresh_sample()
+        finally:
+            self.syncing_channels = False
+        self.sync_ui()
+        self.update_scale_legends()
+
+    def fit_shared_style(self, mode):
+        from normalization import detail_settings
+        from channel_viewer import ChannelStyle
+
+        candidates = []
+        for panel in (getattr(self, 'left', None), self.right):
+            if panel is None:
+                continue
+            try:
+                # Bypass the shared-style override while collecting source statistics.
+                frame = ChannelViewer.frame_for(panel, mode)
+                if frame is not None:
+                    limits = detail_settings(frame.pixels, frame.white_is_zero)
+                    candidates.append((panel, frame, limits))
+            except (OSError, ValueError, IndexError):
+                continue
+        if not candidates:
+            return None
+        # Every image contributes its own robust limits regardless of its resolution.
+        low = min(entry[2][0] for entry in candidates)
+        high = max(entry[2][1] for entry in candidates)
+        reference = max(candidates, key=lambda entry: (entry[2][1], -entry[2][0]))
+        gamma = reference[2][2]
+        source = next((entry for entry in candidates if entry[0] is self.active), reference)
+        color = source[0].colors[mode]
+        return ChannelStyle(low, high, gamma, source[1].white_is_zero, color)

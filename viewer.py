@@ -66,8 +66,9 @@ class ImageView(QGraphicsView):
             return
         if self.zoom_mode == 'Вписать':
             rect = self.sceneRect()
-            scale = min(max(1, self.viewport().width() - 2) / rect.width(),
-                        max(1, self.viewport().height() - 2) / rect.height())
+            viewport_size = getattr(self, 'fit_viewport_size', None)
+            width, height = viewport_size or (self.viewport().width(), self.viewport().height())
+            scale = min(max(1, width - 2) / rect.width(), max(1, height - 2) / rect.height())
         else:
             scale = float(self.zoom_mode.rstrip('%')) / 100
         self.resetTransform()
@@ -326,9 +327,11 @@ class Viewer(QMainWindow):
 
 
 def main():
+    from comparison_viewer import ComparisonViewer
+
     folder = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parent / 'data'
     app = QApplication(sys.argv)
-    window = Viewer(folder)
+    window = ComparisonViewer(folder)
     window.show()
     return app.exec()
 

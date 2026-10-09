@@ -416,6 +416,11 @@ class ComparisonViewer(QMainWindow):
             for panel in (self.left, self.right):
                 panel.zoom.setCurrentText('Вписать')
             self.splitter.handle(1).setEnabled(False)
+            if not hasattr(self, 'registration_button'):
+                self.registration_button = self.nav_button(
+                    'Совместить…', 'Совместить активные каналы двух панелей по кругам пластин', self.open_registration)
+        if hasattr(self, 'registration_button'):
+            self.registration_button.setVisible(enabled)
         self.sync_ui()
 
     def resizeEvent(self, event):
@@ -545,3 +550,34 @@ class ComparisonViewer(QMainWindow):
         source = next((entry for entry in candidates if entry[0] is self.active), reference)
         color = source[0].colors[mode]
         return ChannelStyle(low, high, gamma, source[1].white_is_zero, color)
+
+    def open_registration(self):
+        from PyQt6.QtWidgets import QMessageBox
+        from registration_workspace import RegistrationWorkspace
+
+        if not self.compare.isChecked() or self.right is None:
+            self.statusBar().showMessage('Включите две панели и выберите снимки для совмещения.')
+            return
+        panels = (self.left, self.right)
+        if any(panel.frame is None or panel.capture is None for panel in panels):
+            self.statusBar().showMessage('Для совмещения выберите доступный активный канал в обеих панелях.')
+            return
+        titles = [
+            f'{panel.accessibleName()}: {panel.sample_key[1]} · {panel.active_mode} · страница {panel.pages.currentText()}'
+            for panel in panels]
+        try:
+            sources = []
+            for panel in panels:
+                path = panel.capture.path.resolve()
+                stat = path.stat()
+                sources.append({'path': str(path), 'page': panel.page_indices.get(panel.capture.path, 0),
+                                'shape': list(panel.frame.pixels.shape), 'dtype': str(panel.frame.pixels.dtype),
+                                'white_is_zero': panel.frame.white_is_zero,
+                                'size_bytes': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
+                                'sample': panel.sample_key[1], 'channel': panel.active_mode})
+            dialog = RegistrationWorkspace(self.left.frame, self.right.frame, titles, self, sources=sources)
+        except (OSError, ValueError, MemoryError) as error:
+            QMessageBox.warning(self, 'Совмещение', str(error))
+            return
+        dialog.exec()
+        dialog.deleteLater()
